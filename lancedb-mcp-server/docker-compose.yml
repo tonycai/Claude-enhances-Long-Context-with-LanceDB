@@ -1,0 +1,26 @@
+# docker-compose.yml — build helper for lancedb-code MCP server
+#
+# Usage:
+#   docker compose build          # Build the image
+#   docker compose run --rm mcp   # One-shot test (stdio)
+#
+# NOTE: For Claude Code integration, use `docker run -i` directly
+# (see README.md). docker compose up is not suited for stdio transport.
+
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lancedb-code-mcp:latest
+    stdin_open: true        # -i (keep stdin open for JSON-RPC)
+    tty: false              # no TTY — TTY corrupts the binary JSON-RPC stream
+    volumes:
+      - ../:/workspace:ro   # Source repo (read-only)
+      - lancedb-data:/data/lancedb  # Persistent index
+    environment:
+      - LANCEDB_PATH=/data/lancedb
+      - LANCEDB_REPO_ROOT=/workspace
+
+volumes:
+  lancedb-data:

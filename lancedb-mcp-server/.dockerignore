@@ -1,0 +1,27 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# LanceDB data (rebuilt at runtime)
+.lancedb/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Git
+.git/
