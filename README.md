@@ -81,6 +81,45 @@ Once configured, Claude Code automatically has access to the search tools. A typ
 2. **Search by meaning**: Claude calls `search_code` with natural language queries
 3. **Incremental updates**: After edits, Claude calls `index_files` with changed paths
 
+### Docker
+
+Build and run without installing Python, uv, or any native dependencies on your host. The LanceDB index and embedding model are persisted across container restarts.
+
+```bash
+# Build the image (includes all tree-sitter grammars + pre-downloaded model)
+cd lancedb-mcp-server && docker compose build
+
+# Test that stdio transport responds to MCP initialize
+echo '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}},"id":1}' \
+  | docker run -i --rm \
+      -v "$(pwd)/..:/workspace:ro" \
+      -v lancedb-data:/data/lancedb \
+      lancedb-code-mcp:latest
+```
+
+Configure Claude Code to use the Docker image in your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "lancedb-code": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "docker run -i --rm -v \"$(pwd):/workspace:ro\" -v lancedb-data:/data/lancedb lancedb-code-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+**Volume mounts:**
+
+| Mount | Container Path | Purpose |
+|-------|---------------|---------|
+| Source repo | `/workspace` (read-only bind) | Codebase to index |
+| LanceDB data | `/data/lancedb` (named volume) | Persistent search index |
+
 ### Run the Integration Test
 
 ```bash
@@ -111,7 +150,11 @@ All settings are via environment variables:
 │   ├── indexer.py             # File discovery, hashing, ingestion
 │   ├── config.py              # Environment-based configuration
 │   ├── test_integration.py    # End-to-end integration test
-│   └── pyproject.toml         # Dependencies and build config
+│   ├── pyproject.toml         # Dependencies and build config
+│   ├── Dockerfile             # Multi-stage Docker build
+│   ├── docker-compose.yml     # Build orchestration + volumes
+│   └── scripts/
+│       └── prefetch_model.py  # Pre-download embedding model at build time
 ├── Docs/
 │   └── Integrating-LanceDB-with-Claude-Code-CLI.md  # Architecture guide (36 citations)
 └── LICENSE                    # Apache 2.0
