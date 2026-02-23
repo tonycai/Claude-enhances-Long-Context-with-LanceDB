@@ -71,7 +71,7 @@ def _load_language(lang_key: str) -> Language | None:
         lang = Language(lang_func())
         _LANGUAGES[lang_key] = lang
         return lang
-    except (ImportError, AttributeError, Exception) as exc:
+    except Exception as exc:
         logger.debug("Tree-sitter grammar not available for %s: %s", lang_key, exc)
         return None
 

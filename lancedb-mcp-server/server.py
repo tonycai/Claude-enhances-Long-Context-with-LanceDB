@@ -229,7 +229,10 @@ def search_code(
 
         results = search.limit(limit).to_list()
     except Exception as exc:
-        logger.error("Search failed: %s", exc)
+        logger.error(
+            "Search failed for query=%r, query_type=%s, where=%r: %s",
+            query, query_type, where_clause, exc,
+        )
         return f"Search error: {exc}"
 
     return _format_results(results, query)
@@ -262,7 +265,10 @@ def index_files(
             table=app.table, config=app.config, paths=paths, force=force
         )
     except Exception as exc:
-        logger.error("Indexing failed: %s", exc)
+        logger.error(
+            "Indexing failed (paths=%r, force=%s): %s",
+            paths, force, exc,
+        )
         return f"Indexing error: {exc}"
 
     # Rebuild FTS index after ingestion.
@@ -296,7 +302,8 @@ def index_status(ctx: Context[ServerSession, AppContext] = None) -> str:
 
     try:
         arrow_table = app.table.to_arrow()
-    except Exception:
+    except Exception as exc:
+        logger.debug("to_arrow() failed (treating as empty index): %s", exc)
         return "Index is empty. Run index_files to build it."
 
     if arrow_table.num_rows == 0:
@@ -322,8 +329,8 @@ def index_status(ctx: Context[ServerSession, AppContext] = None) -> str:
     indices = []
     try:
         indices = app.table.list_indices()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("list_indices() failed (non-fatal): %s", exc)
     has_vector_idx = any("vector" in str(idx) for idx in indices)
     has_fts_idx = any("fts" in str(idx).lower() or "text" in str(idx) for idx in indices)
 
