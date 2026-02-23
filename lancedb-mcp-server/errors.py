@@ -26,3 +26,7 @@ class SearchError(LanceDBMCPError):
 
 class ChunkingError(LanceDBMCPError):
     """Raised when source file chunking fails."""
+
+
+class ProjectError(LanceDBMCPError):
+    """Raised when a project operation fails (invalid name, not found, etc.)."""

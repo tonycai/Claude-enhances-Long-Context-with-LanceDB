@@ -169,6 +169,117 @@ def main():
     print(f"  Languages:    {dict(Counter(at.column('language').to_pylist()))}")
     print(f"  Node types:   {dict(Counter(at.column('node_type').to_pylist()))}")
 
+    # Step 8: Multi-project support
+    print()
+    print("=" * 60)
+    print("STEP 8: Multi-Project Support")
+    print("=" * 60)
+
+    from projects import (
+        DEFAULT_PROJECT_NAME,
+        DEFAULT_TABLE_NAME,
+        ProjectState,
+        create_project,
+        load_registry,
+        save_registry,
+        table_name_for_project,
+        validate_project_name,
+    )
+    from errors import ProjectError
+
+    # 8a: Validate project names
+    print("  8a: Name validation")
+    good_names = ["default", "frontend", "my-app", "Project_1"]
+    bad_names = ["", "1invalid", "a" * 64, "has space", "has.dot", "@nope"]
+    for name in good_names:
+        try:
+            validate_project_name(name)
+            print(f"    '{name}' — valid (OK)")
+        except ProjectError:
+            print(f"    '{name}' — FAIL (expected valid)")
+            sys.exit(1)
+    for name in bad_names:
+        try:
+            validate_project_name(name)
+            print(f"    '{name}' — FAIL (expected invalid)")
+            sys.exit(1)
+        except ProjectError:
+            print(f"    '{name}' — invalid (OK)")
+
+    # 8b: Table naming convention
+    print("  8b: Table naming")
+    assert table_name_for_project("default") == "code_chunks", "default → code_chunks"
+    assert table_name_for_project("frontend") == "project_frontend", "frontend → project_frontend"
+    print(f"    'default'  → '{table_name_for_project('default')}' (OK)")
+    print(f"    'frontend' → '{table_name_for_project('frontend')}' (OK)")
+
+    # 8c: Create a second project scoped to lancedb-mcp-server/ subdirectory
+    print("  8c: Create second project")
+    mcp_dir = os.path.join(REPO_ROOT, "lancedb-mcp-server")
+    proj2 = create_project("mcp-server", mcp_dir)
+    assert proj2.name == "mcp-server"
+    assert proj2.table_name == "project_mcp-server"
+    assert proj2.repo_root == str(Path(mcp_dir).resolve())
+    print(f"    Created project '{proj2.name}' → table '{proj2.table_name}'")
+    print(f"    repo_root: {proj2.repo_root}")
+
+    # 8d: Registry save/load round-trip
+    print("  8d: Registry round-trip")
+    projects_dict = {
+        DEFAULT_PROJECT_NAME: ProjectState(
+            name=DEFAULT_PROJECT_NAME,
+            repo_root=REPO_ROOT,
+            table_name=DEFAULT_TABLE_NAME,
+            created_at="2025-01-01T00:00:00+00:00",
+        ),
+        proj2.name: proj2,
+    }
+    save_registry(config.db_full_path, projects_dict)
+    loaded = load_registry(config.db_full_path)
+    assert set(loaded.keys()) == {DEFAULT_PROJECT_NAME, "mcp-server"}, (
+        f"Expected 2 projects, got {set(loaded.keys())}"
+    )
+    assert loaded["mcp-server"].table_name == "project_mcp-server"
+    print(f"    Saved and loaded {len(loaded)} projects (OK)")
+
+    # 8e: Index the second project into its own table
+    print("  8e: Index second project")
+    proj2_table_name = proj2.table_name
+    if proj2_table_name in db.list_tables():
+        db.drop_table(proj2_table_name)
+    table2 = db.create_table(proj2_table_name, schema=CodeChunk)
+
+    result3 = index_files(table2, config, repo_root=Path(proj2.repo_root))
+    print(f"    Files scanned:  {result3.files_scanned}")
+    print(f"    Files indexed:  {result3.files_indexed}")
+    print(f"    Chunks created: {result3.chunks_created}")
+    assert result3.files_indexed > 0, "Second project should index some files"
+
+    # 8f: Verify isolation — file sets differ between projects
+    print("  8f: Verify isolation")
+    at1 = table.to_arrow()
+    at2 = table2.to_arrow()
+    files1 = set(at1.column("file_path").to_pylist())
+    files2 = set(at2.column("file_path").to_pylist())
+    print(f"    Project 'default': {len(files1)} files")
+    print(f"    Project 'mcp-server': {len(files2)} files")
+    # The mcp-server project (scoped to subdirectory) should have fewer files
+    # than the full repo project, and the paths should differ.
+    assert len(files2) < len(files1), (
+        f"Subdirectory project should have fewer files ({len(files2)}) "
+        f"than full repo ({len(files1)})"
+    )
+    # files2 paths are relative to mcp-server/, files1 to repo root
+    # So they should be different sets
+    assert files1 != files2, "File sets should differ between projects"
+    print("    Isolation verified (OK)")
+
+    # 8g: Clean up second table
+    print("  8g: Cleanup second project table")
+    db.drop_table(proj2_table_name)
+    print(f"    Dropped table '{proj2_table_name}'")
+    print()
+
     # Cleanup
     print()
     print("=" * 60)

@@ -1,10 +1,13 @@
 """LanceDB MCP server for semantic code search in Claude Code CLI.
 
-Exposes four tools over stdio transport:
-  - search_code:   hybrid vector + full-text search with metadata filters
-  - index_files:   index or re-index source files into LanceDB
-  - index_status:  check index health and stats
-  - remove_files:  remove deleted files from the index
+Exposes seven tools over stdio transport:
+  - search_code:     hybrid vector + full-text search with metadata filters
+  - index_files:     index or re-index source files into LanceDB
+  - index_status:    check index health and stats
+  - remove_files:    remove deleted files from the index
+  - switch_project:  switch to (or create) a project context
+  - list_projects:   list all registered projects
+  - remove_project:  unregister a project (optionally drop its table)
 """
 
 from __future__ import annotations
@@ -13,7 +16,8 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import lancedb as ldb
 from lancedb.embeddings import get_registry
@@ -23,9 +27,18 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from config import VALID_NODE_TYPES, Config
+from errors import ProjectError
 from indexer import IndexResult
 from indexer import index_files as do_index_files
 from indexer import remove_files as do_remove_files
+from projects import (
+    DEFAULT_PROJECT_NAME,
+    DEFAULT_TABLE_NAME,
+    ProjectState,
+    create_project,
+    load_registry,
+    save_registry,
+)
 
 # ---------------------------------------------------------------------------
 # Logging — must use stderr for stdio MCP servers.
@@ -68,14 +81,61 @@ def _build_schema(embedding_func):
 @dataclass
 class AppContext:
     db: ldb.DBConnection
-    table: ldb.table.Table
     config: Config
     schema: type
+    projects: dict[str, ProjectState]       # name → state
+    active_project: str | None
+    tables: dict[str, ldb.table.Table] = field(default_factory=dict)  # lazy cache
+
+
+def _open_or_create_table(
+    db: ldb.DBConnection, table_name: str, schema: type,
+) -> ldb.table.Table:
+    """Open an existing LanceDB table or create a new one."""
+    if table_name in db.list_tables():
+        table = db.open_table(table_name)
+        logger.info("Opened existing table '%s'", table_name)
+    else:
+        table = db.create_table(table_name, schema=schema)
+        logger.info("Created new table '%s'", table_name)
+    return table
+
+
+def _resolve_table(
+    app: AppContext, project: str | None = None,
+) -> tuple[ldb.table.Table, ProjectState]:
+    """Resolve the LanceDB table and project state for the given project.
+
+    If *project* is ``None``, the active project is used.  Raises
+    ``ProjectError`` if no project can be determined or if the requested
+    project is not registered.
+    """
+    name = project or app.active_project
+    if not name:
+        raise ProjectError(
+            "No active project. Use switch_project to select one.",
+        )
+
+    proj = app.projects.get(name)
+    if proj is None:
+        registered = ", ".join(sorted(app.projects)) or "(none)"
+        raise ProjectError(
+            f"Project '{name}' not found. Registered projects: {registered}",
+            context={"project": name},
+        )
+
+    # Lazy-open the table.
+    if name not in app.tables:
+        app.tables[name] = _open_or_create_table(
+            app.db, proj.table_name, app.schema,
+        )
+
+    return app.tables[name], proj
 
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
-    """Initialize the LanceDB connection and table on startup."""
+    """Initialize the LanceDB connection, load project registry, yield context."""
     logger.info("Starting LanceDB MCP server")
     logger.info("  DB path: %s", config.db_full_path)
     logger.info("  Repo root: %s", config.repo_root_path)
@@ -91,24 +151,67 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     )
     schema = _build_schema(embedding_func)
 
-    # Open or create table.
-    table_names = db.list_tables()
-    if config.table_name in table_names:
-        table = db.open_table(config.table_name)
-        logger.info("Opened existing table '%s'", config.table_name)
+    # Load project registry (or bootstrap from legacy state).
+    projects = load_registry(config.db_full_path)
+
+    if not projects:
+        # Legacy fallback: if the old default table exists, adopt it.
+        table_names = db.list_tables()
+        if DEFAULT_TABLE_NAME in table_names:
+            logger.info(
+                "No project registry found; adopting existing '%s' table "
+                "as project '%s'",
+                DEFAULT_TABLE_NAME, DEFAULT_PROJECT_NAME,
+            )
+            from datetime import datetime, timezone
+            projects[DEFAULT_PROJECT_NAME] = ProjectState(
+                name=DEFAULT_PROJECT_NAME,
+                repo_root=str(config.repo_root_path),
+                table_name=DEFAULT_TABLE_NAME,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            save_registry(config.db_full_path, projects)
+        else:
+            # No existing table — create the default project.
+            projects[DEFAULT_PROJECT_NAME] = ProjectState(
+                name=DEFAULT_PROJECT_NAME,
+                repo_root=str(config.repo_root_path),
+                table_name=DEFAULT_TABLE_NAME,
+                created_at=__import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc
+                ).isoformat(),
+            )
+            save_registry(config.db_full_path, projects)
+
+    # Determine active project.
+    if DEFAULT_PROJECT_NAME in projects:
+        active = DEFAULT_PROJECT_NAME
     else:
-        table = db.create_table(config.table_name, schema=schema)
-        logger.info("Created new table '%s'", config.table_name)
+        active = next(iter(projects)) if projects else None
+
+    logger.info(
+        "Loaded %d project(s); active: %s",
+        len(projects), active,
+    )
+
+    app = AppContext(
+        db=db,
+        config=config,
+        schema=schema,
+        projects=projects,
+        active_project=active,
+    )
 
     try:
-        yield AppContext(db=db, table=table, config=config, schema=schema)
+        yield app
     finally:
-        # Compact and clean up on shutdown.
-        try:
-            table.optimize()
-            logger.info("Table optimized on shutdown")
-        except Exception as exc:
-            logger.warning("optimize() failed on shutdown: %s", exc)
+        # Compact and clean up all open tables on shutdown.
+        for tname, tbl in app.tables.items():
+            try:
+                tbl.optimize()
+                logger.info("Table '%s' optimized on shutdown", tname)
+            except Exception as exc:
+                logger.warning("optimize() failed for '%s' on shutdown: %s", tname, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +228,164 @@ mcp = FastMCP(
     ),
     lifespan=app_lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Tool: switch_project
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def switch_project(
+    project: str,
+    repo_root: str | None = None,
+    ctx: Context[ServerSession, AppContext] = None,
+) -> str:
+    """Switch to a project context (or create a new one).
+
+    If the project already exists, it becomes the active project. Pass
+    ``repo_root`` to update the repo root of an existing project or to
+    create a brand-new project.
+
+    Args:
+        project: Project name (letters, digits, underscore, hyphen; 1-63 chars).
+        repo_root: Absolute path to the repository root. Required for new projects.
+    """
+    app: AppContext = ctx.request_context.lifespan_context
+
+    try:
+        if project in app.projects:
+            # Existing project — switch to it.
+            if repo_root is not None:
+                resolved = str(Path(repo_root).resolve())
+                if not Path(resolved).is_dir():
+                    return f"Error: repo_root is not a directory: {repo_root}"
+                app.projects[project].repo_root = resolved
+                save_registry(app.config.db_full_path, app.projects)
+            app.active_project = project
+            proj = app.projects[project]
+            return (
+                f"Switched to project '{project}'.\n"
+                f"  repo_root: {proj.repo_root}\n"
+                f"  table: {proj.table_name}"
+            )
+
+        # New project — repo_root is required.
+        if repo_root is None:
+            return (
+                f"Project '{project}' does not exist. "
+                f"Provide repo_root to create it."
+            )
+
+        proj = create_project(project, repo_root)
+        app.projects[project] = proj
+
+        # Eagerly open/create the table so it's ready.
+        app.tables[project] = _open_or_create_table(
+            app.db, proj.table_name, app.schema,
+        )
+
+        save_registry(app.config.db_full_path, app.projects)
+        app.active_project = project
+
+        return (
+            f"Created and switched to project '{project}'.\n"
+            f"  repo_root: {proj.repo_root}\n"
+            f"  table: {proj.table_name}"
+        )
+    except ProjectError as exc:
+        return f"Project error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_projects
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_projects(
+    ctx: Context[ServerSession, AppContext] = None,
+) -> str:
+    """List all registered projects with their repo roots and table names.
+
+    The active project is marked with an asterisk (*).
+    """
+    app: AppContext = ctx.request_context.lifespan_context
+
+    if not app.projects:
+        return "No projects registered. Use switch_project to create one."
+
+    lines: list[str] = [f"Registered projects ({len(app.projects)}):\n"]
+    for name in sorted(app.projects):
+        proj = app.projects[name]
+        marker = " *" if name == app.active_project else ""
+        lines.append(
+            f"  {name}{marker}\n"
+            f"    repo_root:  {proj.repo_root}\n"
+            f"    table:      {proj.table_name}\n"
+            f"    created_at: {proj.created_at}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: remove_project
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def remove_project(
+    project: str,
+    drop_table: bool = False,
+    ctx: Context[ServerSession, AppContext] = None,
+) -> str:
+    """Remove a project from the registry.
+
+    Args:
+        project: Name of the project to remove.
+        drop_table: If True, also drop the LanceDB table and its data.
+    """
+    app: AppContext = ctx.request_context.lifespan_context
+
+    if project not in app.projects:
+        registered = ", ".join(sorted(app.projects)) or "(none)"
+        return f"Project '{project}' not found. Registered: {registered}"
+
+    proj = app.projects.pop(project)
+
+    # Close cached table handle.
+    app.tables.pop(project, None)
+
+    if drop_table:
+        try:
+            app.db.drop_table(proj.table_name)
+            logger.info("Dropped table '%s' for project '%s'", proj.table_name, project)
+        except Exception as exc:
+            logger.warning(
+                "Failed to drop table '%s' for project '%s': %s",
+                proj.table_name, project, exc,
+            )
+
+    save_registry(app.config.db_full_path, app.projects)
+
+    # Update active project.
+    if app.active_project == project:
+        if app.projects:
+            app.active_project = (
+                DEFAULT_PROJECT_NAME
+                if DEFAULT_PROJECT_NAME in app.projects
+                else next(iter(app.projects))
+            )
+        else:
+            app.active_project = None
+
+    drop_msg = " Table dropped." if drop_table else ""
+    active_msg = (
+        f" Active project: {app.active_project}"
+        if app.active_project
+        else " No active project."
+    )
+    return f"Removed project '{project}'.{drop_msg}{active_msg}"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +442,7 @@ def search_code(
     file_path_pattern: str | None = None,
     node_type: str | None = None,
     query_type: str = "hybrid",
+    project: str | None = None,
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
     """Search the codebase semantically. Returns ranked code snippets with file locations.
@@ -195,8 +457,14 @@ def search_code(
         file_path_pattern: Filter by file path prefix (e.g. "src/auth/").
         node_type: Filter by code structure type: function, class, method, module, block.
         query_type: Search mode — "hybrid" (default), "vector", or "fts".
+        project: Project to search in. Defaults to the active project.
     """
     app: AppContext = ctx.request_context.lifespan_context
+
+    try:
+        table, _proj = _resolve_table(app, project)
+    except ProjectError as exc:
+        return f"Project error: {exc}"
 
     # Build filter expression.
     filters: list[str] = []
@@ -219,7 +487,7 @@ def search_code(
         query_type = "hybrid"
 
     try:
-        search = app.table.search(query, query_type=query_type)
+        search = table.search(query, query_type=query_type)
 
         if where_clause:
             search = search.where(where_clause, prefilter=True)
@@ -247,6 +515,7 @@ def search_code(
 def index_files(
     paths: list[str] | None = None,
     force: bool = False,
+    project: str | None = None,
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
     """Index source files into the search database.
@@ -257,12 +526,22 @@ def index_files(
     Args:
         paths: File paths to index. None means scan the full repository.
         force: Re-index files even if unchanged (default False).
+        project: Project to index into. Defaults to the active project.
     """
     app: AppContext = ctx.request_context.lifespan_context
 
     try:
+        table, proj = _resolve_table(app, project)
+    except ProjectError as exc:
+        return f"Project error: {exc}"
+
+    try:
         result: IndexResult = do_index_files(
-            table=app.table, config=app.config, paths=paths, force=force
+            table=table,
+            config=app.config,
+            paths=paths,
+            force=force,
+            repo_root=Path(proj.repo_root),
         )
     except Exception as exc:
         logger.error(
@@ -273,12 +552,12 @@ def index_files(
 
     # Rebuild FTS index after ingestion.
     try:
-        app.table.create_fts_index("text", replace=True)
+        table.create_fts_index("text", replace=True)
     except Exception as exc:
         logger.warning("FTS index rebuild failed (non-fatal): %s", exc)
 
     return (
-        f"Indexing complete in {result.duration_ms}ms:\n"
+        f"Indexing complete for project '{proj.name}' in {result.duration_ms}ms:\n"
         f"  Files scanned: {result.files_scanned}\n"
         f"  Files indexed: {result.files_indexed}\n"
         f"  Files skipped (unchanged): {result.files_skipped}\n"
@@ -292,22 +571,33 @@ def index_files(
 
 
 @mcp.tool()
-def index_status(ctx: Context[ServerSession, AppContext] = None) -> str:
+def index_status(
+    project: str | None = None,
+    ctx: Context[ServerSession, AppContext] = None,
+) -> str:
     """Check the current state of the code search index.
 
     Returns the number of indexed files, chunks, languages, and whether the
     index is healthy. Use this to determine if the index needs rebuilding.
+
+    Args:
+        project: Project to check. Defaults to the active project.
     """
     app: AppContext = ctx.request_context.lifespan_context
 
     try:
-        arrow_table = app.table.to_arrow()
+        table, proj = _resolve_table(app, project)
+    except ProjectError as exc:
+        return f"Project error: {exc}"
+
+    try:
+        arrow_table = table.to_arrow()
     except Exception as exc:
         logger.debug("to_arrow() failed (treating as empty index): %s", exc)
-        return "Index is empty. Run index_files to build it."
+        return f"Index for project '{proj.name}' is empty. Run index_files to build it."
 
     if arrow_table.num_rows == 0:
-        return "Index is empty. Run index_files to build it."
+        return f"Index for project '{proj.name}' is empty. Run index_files to build it."
 
     total_chunks = arrow_table.num_rows
     total_files = len(set(arrow_table.column("file_path").to_pylist()))
@@ -328,14 +618,15 @@ def index_status(ctx: Context[ServerSession, AppContext] = None) -> str:
     # Check index health.
     indices = []
     try:
-        indices = app.table.list_indices()
+        indices = table.list_indices()
     except Exception as exc:
         logger.debug("list_indices() failed (non-fatal): %s", exc)
     has_vector_idx = any("vector" in str(idx) for idx in indices)
     has_fts_idx = any("fts" in str(idx).lower() or "text" in str(idx) for idx in indices)
 
     return (
-        f"Index status:\n"
+        f"Index status for project '{proj.name}':\n"
+        f"  Repo root: {proj.repo_root}\n"
         f"  Total chunks: {total_chunks}\n"
         f"  Total files: {total_files}\n"
         f"  Languages: {lang_summary}\n"
@@ -353,6 +644,7 @@ def index_status(ctx: Context[ServerSession, AppContext] = None) -> str:
 @mcp.tool()
 def remove_files(
     paths: list[str],
+    project: str | None = None,
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
     """Remove files from the search index.
@@ -361,11 +653,19 @@ def remove_files(
 
     Args:
         paths: File paths to remove from the index.
+        project: Project to remove files from. Defaults to the active project.
     """
     app: AppContext = ctx.request_context.lifespan_context
 
-    removed = do_remove_files(app.table, paths, app.config)
-    return f"Removed {removed} file(s) from the index."
+    try:
+        table, proj = _resolve_table(app, project)
+    except ProjectError as exc:
+        return f"Project error: {exc}"
+
+    removed = do_remove_files(
+        table, paths, app.config, repo_root=Path(proj.repo_root),
+    )
+    return f"Removed {removed} file(s) from the index (project '{proj.name}')."
 
 
 # ---------------------------------------------------------------------------
