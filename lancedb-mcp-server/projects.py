@@ -152,15 +152,13 @@ def create_project(name: str, repo_root: str) -> ProjectState:
     """Validate inputs and return a new ``ProjectState``.
 
     The caller is responsible for persisting the state to the registry.
+    Path existence is *not* validated here — the repo may be mounted at a
+    different path inside a Docker container, or may not exist yet.
+    Actual path validation happens at indexing time.
     """
     validate_project_name(name)
 
     resolved = str(Path(repo_root).resolve())
-    if not Path(resolved).is_dir():
-        raise ProjectError(
-            f"repo_root does not exist or is not a directory: {repo_root}",
-            context={"repo_root": repo_root},
-        )
 
     return ProjectState(
         name=name,
@@ -168,3 +166,13 @@ def create_project(name: str, repo_root: str) -> ProjectState:
         table_name=table_name_for_project(name),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
+
+
+def check_repo_root(repo_root: str) -> str | None:
+    """Return a warning string if *repo_root* does not exist, else ``None``."""
+    if not Path(repo_root).is_dir():
+        return (
+            f"Warning: repo_root '{repo_root}' does not exist on this system. "
+            f"If running in Docker, use the container mount path (e.g. /workspace)."
+        )
+    return None

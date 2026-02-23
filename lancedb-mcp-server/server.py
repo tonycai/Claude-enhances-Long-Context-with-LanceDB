@@ -35,6 +35,7 @@ from projects import (
     DEFAULT_PROJECT_NAME,
     DEFAULT_TABLE_NAME,
     ProjectState,
+    check_repo_root,
     create_project,
     load_registry,
     save_registry,
@@ -270,17 +271,19 @@ def switch_project(
             # Existing project — switch to it.
             if repo_root is not None:
                 resolved = str(Path(repo_root).resolve())
-                if not Path(resolved).is_dir():
-                    return f"Error: repo_root is not a directory: {repo_root}"
                 app.projects[project].repo_root = resolved
                 save_registry(app.config.db_full_path, app.projects)
             app.active_project = project
             proj = app.projects[project]
-            return (
+            msg = (
                 f"Switched to project '{project}'.\n"
                 f"  repo_root: {proj.repo_root}\n"
                 f"  table: {proj.table_name}"
             )
+            warning = check_repo_root(proj.repo_root)
+            if warning:
+                msg += f"\n  {warning}"
+            return msg
 
         # New project — repo_root is required.
         if repo_root is None:
@@ -300,11 +303,15 @@ def switch_project(
         save_registry(app.config.db_full_path, app.projects)
         app.active_project = project
 
-        return (
+        msg = (
             f"Created and switched to project '{project}'.\n"
             f"  repo_root: {proj.repo_root}\n"
             f"  table: {proj.table_name}"
         )
+        warning = check_repo_root(proj.repo_root)
+        if warning:
+            msg += f"\n  {warning}"
+        return msg
     except ProjectError as exc:
         return f"Project error: {exc}"
 
