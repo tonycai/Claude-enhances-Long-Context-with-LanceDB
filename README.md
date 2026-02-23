@@ -184,6 +184,64 @@ All settings are via environment variables:
 | `tree-sitter` >=0.23.0 | Syntax-aware code parsing |
 | `pathspec` >=0.12.0 | `.gitignore`-compatible file matching |
 
+## Agent Team (Claude Agent SDK)
+
+A team of specialized agents built with the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) that provides a programmatic interface to the LanceDB code search tools.
+
+### Architecture
+
+```
+User Query
+    │
+    ▼
+Orchestrator (sonnet)
+    ├── Task → Indexer Agent (haiku)      — index_files, index_status, remove_files
+    ├── Task → Searcher Agent (sonnet)    — search_code, Read, Grep, Glob
+    ├── Task → Reviewer Agent (opus)      — search_code, Read, Grep, Glob
+    └── Task → Q&A Agent (sonnet)         — search_code, index_status, Read, Grep, Glob
+```
+
+The orchestrator routes user queries to the appropriate specialist agent via the `Task` tool. Each agent has focused prompts and access to specific MCP tools from the lancedb-code server.
+
+| Agent | Role | Model |
+|-------|------|-------|
+| Orchestrator | Routes queries to specialists | Sonnet |
+| Indexer | Full/incremental indexing, status, cleanup | Haiku |
+| Searcher | Semantic code search with filters | Sonnet |
+| Reviewer | Code quality and security review | Opus |
+| Q&A | Codebase explanations and architecture | Sonnet |
+
+### Install
+
+```bash
+cd agents && uv sync
+```
+
+### Usage
+
+```bash
+# Requires ANTHROPIC_API_KEY
+cd agents
+
+# Index the repository
+uv run python orchestrator.py "Index the repository"
+
+# Search for code
+uv run python orchestrator.py "Find all error handling code"
+
+# Code review
+uv run python orchestrator.py "Review server.py for security issues"
+
+# Codebase Q&A
+uv run python orchestrator.py "How does the chunking pipeline work?"
+```
+
+### Run Validation Tests
+
+```bash
+cd agents && uv run python test_agents.py
+```
+
 ## Project Structure
 
 ```
@@ -200,6 +258,23 @@ All settings are via environment variables:
 │   ├── .dockerignore          # Excludes .venv, __pycache__, .lancedb from build context
 │   └── scripts/
 │       └── prefetch_model.py  # Pre-download embedding model at build time
+├── agents/
+│   ├── orchestrator.py        # Entry point: query routing to specialist agents
+│   ├── config.py              # Shared config: models, paths, MCP server, prompt loader
+│   ├── test_agents.py         # Validation tests (imports, config, agent definitions)
+│   ├── pyproject.toml         # Dependencies (claude-agent-sdk)
+│   ├── agents/                # Agent definitions package
+│   │   ├── __init__.py        # Exports ALL_AGENTS dict
+│   │   ├── indexer.py         # Indexer agent definition
+│   │   ├── searcher.py        # Searcher agent definition
+│   │   ├── reviewer.py        # Reviewer agent definition
+│   │   └── qa.py              # Q&A agent definition
+│   └── prompts/               # System prompts (Markdown, editable without code changes)
+│       ├── orchestrator.md
+│       ├── indexer.md
+│       ├── searcher.md
+│       ├── reviewer.md
+│       └── qa.md
 ├── Docs/
 │   └── Integrating-LanceDB-with-Claude-Code-CLI.md  # Architecture guide (36 citations)
 ├── CLAUDE.md                  # Claude Code project guidance (gitignored)
