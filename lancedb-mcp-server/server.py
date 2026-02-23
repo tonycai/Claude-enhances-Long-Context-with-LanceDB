@@ -222,9 +222,13 @@ mcp = FastMCP(
     "lancedb-code",
     instructions=(
         "Semantic code search server backed by LanceDB. "
-        "Use search_code to find relevant code by meaning. "
-        "Use index_files to build or update the search index. "
-        "Use index_status to check if the index is current."
+        "Typical workflow: (1) call index_files to build/update the index, "
+        "(2) call search_code with a natural language query to find relevant code, "
+        "(3) call index_files with specific paths after editing files. "
+        "For multi-repo setups: use switch_project to create/switch between "
+        "project contexts, each with its own isolated index and repo root. "
+        "Use list_projects to see all registered projects and index_status "
+        "to check if an index needs rebuilding."
     ),
     lifespan=app_lifespan,
 )
@@ -241,15 +245,23 @@ def switch_project(
     repo_root: str | None = None,
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
-    """Switch to a project context (or create a new one).
+    """Switch to an existing project or create a new one.
 
-    If the project already exists, it becomes the active project. Pass
-    ``repo_root`` to update the repo root of an existing project or to
-    create a brand-new project.
+    Each project has its own isolated search index and repo root directory.
+    Use this to work across multiple repositories without running separate servers.
+
+    To create a new project, both ``project`` and ``repo_root`` are required.
+    To switch to an existing project, only ``project`` is needed.
+    Optionally pass ``repo_root`` when switching to update the repo path.
+
+    Examples:
+        - Create: switch_project("backend", "/home/user/backend-repo")
+        - Switch: switch_project("backend")
+        - Update root: switch_project("backend", "/new/path/to/backend")
 
     Args:
-        project: Project name (letters, digits, underscore, hyphen; 1-63 chars).
-        repo_root: Absolute path to the repository root. Required for new projects.
+        project: Project name (start with a letter, 1-63 chars, letters/digits/underscore/hyphen).
+        repo_root: Absolute path to the repository root. Required when creating a new project.
     """
     app: AppContext = ctx.request_context.lifespan_context
 
@@ -306,9 +318,12 @@ def switch_project(
 def list_projects(
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
-    """List all registered projects with their repo roots and table names.
+    """List all registered projects with their details.
 
-    The active project is marked with an asterisk (*).
+    Returns each project's name, repo root path, LanceDB table name, and
+    creation timestamp. The currently active project is marked with an
+    asterisk (*). Use switch_project to change the active project or
+    create a new one.
     """
     app: AppContext = ctx.request_context.lifespan_context
 
@@ -339,11 +354,16 @@ def remove_project(
     drop_table: bool = False,
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
-    """Remove a project from the registry.
+    """Remove a project from the registry and optionally delete its index data.
+
+    By default, only the registry entry is removed and the LanceDB table is
+    kept on disk. Set ``drop_table=True`` to permanently delete the table and
+    all indexed chunks. If the removed project was active, the next available
+    project becomes active automatically.
 
     Args:
-        project: Name of the project to remove.
-        drop_table: If True, also drop the LanceDB table and its data.
+        project: Name of the project to remove (must be a registered project).
+        drop_table: If True, also drop the LanceDB table and all its indexed data.
     """
     app: AppContext = ctx.request_context.lifespan_context
 
@@ -449,6 +469,10 @@ def search_code(
 
     Use this to find relevant code by meaning rather than exact string matching.
     Supports hybrid (vector + keyword), pure vector, or pure full-text search.
+    Results include file path, line range, node type, symbol name, and a truncated
+    snippet so you can decide what to read in full.
+
+    Run index_files first if the index is empty or stale.
 
     Args:
         query: Natural language description of what you're looking for.
@@ -456,7 +480,7 @@ def search_code(
         language: Filter by programming language (e.g. "python", "typescript", "rust").
         file_path_pattern: Filter by file path prefix (e.g. "src/auth/").
         node_type: Filter by code structure type: function, class, method, module, block.
-        query_type: Search mode — "hybrid" (default), "vector", or "fts".
+        query_type: Search mode — "hybrid" (default, best quality), "vector" (semantic only), or "fts" (keyword only).
         project: Project to search in. Defaults to the active project.
     """
     app: AppContext = ctx.request_context.lifespan_context
@@ -521,7 +545,11 @@ def index_files(
     """Index source files into the search database.
 
     Call with no arguments to index the entire repository. Pass specific file
-    paths for incremental updates after editing files.
+    paths for incremental updates after editing files. Unchanged files are
+    automatically skipped via content-hash detection unless ``force=True``.
+
+    Supports Python, JavaScript, TypeScript, Rust, Go, and more via Tree-sitter
+    syntax-aware chunking. Other text formats use line-based fallback chunking.
 
     Args:
         paths: File paths to index. None means scan the full repository.
@@ -577,8 +605,9 @@ def index_status(
 ) -> str:
     """Check the current state of the code search index.
 
-    Returns the number of indexed files, chunks, languages, and whether the
-    index is healthy. Use this to determine if the index needs rebuilding.
+    Returns the number of indexed files, chunks, languages, node type
+    breakdown, and whether vector/FTS indices are present. Use this to
+    determine if the index needs rebuilding or if index_files should be run.
 
     Args:
         project: Project to check. Defaults to the active project.
@@ -647,9 +676,11 @@ def remove_files(
     project: str | None = None,
     ctx: Context[ServerSession, AppContext] = None,
 ) -> str:
-    """Remove files from the search index.
+    """Remove specific files from the search index.
 
-    Use after deleting files to keep the index consistent.
+    Use after deleting or renaming files to keep the index consistent.
+    Removes all indexed chunks for the specified file paths. Paths can
+    be absolute or relative to the project's repo root.
 
     Args:
         paths: File paths to remove from the index.
