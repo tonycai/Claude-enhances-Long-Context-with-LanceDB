@@ -50,6 +50,7 @@ def test_config_imports():
         PROJECT_ROOT,
         PROMPTS_DIR,
         load_prompt,
+        setup_logging,
     )
 
     assert AGENTS_DIR.exists(), f"AGENTS_DIR does not exist: {AGENTS_DIR}"
@@ -202,7 +203,77 @@ check("qa has search_code, index_status, and Read tools", test_qa_tools)
 
 
 # -----------------------------------------------------------------------
-# 5. Orchestrator module
+# 5. Extended config and agent validation
+# -----------------------------------------------------------------------
+
+print("\n--- Extended Validation ---")
+
+
+def test_mcp_config_structure():
+    from config import MCP_SERVERS
+
+    server = MCP_SERVERS["lancedb-code"]
+    assert "type" in server, "MCP server config missing 'type'"
+    assert "command" in server, "MCP server config missing 'command'"
+    assert "args" in server, "MCP server config missing 'args'"
+    assert server["type"] == "stdio"
+    assert isinstance(server["args"], list)
+
+
+check("MCP_SERVERS has correct structure (type, command, args)", test_mcp_config_structure)
+
+
+def test_prompt_no_leading_trailing_whitespace():
+    from config import load_prompt
+
+    for name in EXPECTED_PROMPTS:
+        text = load_prompt(name)
+        assert text == text.strip(), f"Prompt {name} has leading/trailing whitespace"
+
+
+check("load_prompt strips leading/trailing whitespace", test_prompt_no_leading_trailing_whitespace)
+
+
+def test_agent_model_fields():
+    from agents import ALL_AGENTS
+
+    expected_models = {
+        "indexer": "haiku",
+        "searcher": "sonnet",
+        "reviewer": "opus",
+        "qa": "sonnet",
+    }
+    for name, agent in ALL_AGENTS.items():
+        assert agent.model == expected_models[name], (
+            f"{name} model: expected {expected_models[name]!r}, got {agent.model!r}"
+        )
+
+
+check("all agents have expected model field set", test_agent_model_fields)
+
+
+def test_env_var_override():
+    import importlib
+    import os
+
+    os.environ["LANCEDB_MCP_COMMAND"] = "docker run -i --rm lancedb:test"
+    try:
+        import config
+
+        importlib.reload(config)
+        server = config.MCP_SERVERS["lancedb-code"]
+        assert server["command"] == "bash", f"Expected 'bash', got {server['command']!r}"
+        assert server["args"] == ["-c", "docker run -i --rm lancedb:test"]
+    finally:
+        del os.environ["LANCEDB_MCP_COMMAND"]
+        importlib.reload(config)
+
+
+check("LANCEDB_MCP_COMMAND env var overrides MCP_SERVERS", test_env_var_override)
+
+
+# -----------------------------------------------------------------------
+# 6. Orchestrator module
 # -----------------------------------------------------------------------
 
 print("\n--- Orchestrator ---")

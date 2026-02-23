@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -10,7 +13,9 @@ from pathlib import Path
 
 AGENTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = AGENTS_DIR.parent
-MCP_SERVER_DIR = PROJECT_ROOT / "lancedb-mcp-server"
+MCP_SERVER_DIR = Path(
+    os.environ.get("LANCEDB_MCP_SERVER_DIR", str(PROJECT_ROOT / "lancedb-mcp-server"))
+)
 PROMPTS_DIR = AGENTS_DIR / "prompts"
 
 # ---------------------------------------------------------------------------
@@ -27,17 +32,39 @@ MODEL_QA = "claude-sonnet-4-6"
 # MCP server configuration (stdio transport)
 # ---------------------------------------------------------------------------
 
-MCP_SERVERS = {
-    "lancedb-code": {
-        "type": "stdio",
-        "command": "uv",
-        "args": ["--directory", str(MCP_SERVER_DIR), "run", "server.py"],
+_mcp_command = os.environ.get("LANCEDB_MCP_COMMAND")
+
+if _mcp_command:
+    # Custom command override (e.g., "docker run -i --rm ... lancedb-code-mcp:latest")
+    MCP_SERVERS = {
+        "lancedb-code": {
+            "type": "stdio",
+            "command": "bash",
+            "args": ["-c", _mcp_command],
+        }
     }
-}
+else:
+    MCP_SERVERS = {
+        "lancedb-code": {
+            "type": "stdio",
+            "command": "uv",
+            "args": ["--directory", str(MCP_SERVER_DIR), "run", "server.py"],
+        }
+    }
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def setup_logging(debug: bool = False) -> None:
+    """Configure logging for the agent team CLI."""
+    level = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
 
 
 def load_prompt(name: str) -> str:

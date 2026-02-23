@@ -7,6 +7,7 @@ from config import load_prompt
 REVIEWER_AGENT = AgentDefinition(
     description="Conducts code review by searching for relevant code, reading source files, and analyzing quality, security, and maintainability.",
     prompt=load_prompt("reviewer.md"),
+    model="opus",
     tools=[
         "mcp__lancedb-code__search_code",
         "Read",
