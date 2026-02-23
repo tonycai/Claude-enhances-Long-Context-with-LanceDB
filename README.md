@@ -83,7 +83,7 @@ Once configured, Claude Code automatically has access to the search tools. A typ
 
 ### Docker
 
-Build and run without installing Python, uv, or any native dependencies on your host. The LanceDB index and embedding model are persisted across container restarts.
+Build and run without installing Python, uv, or any native dependencies on your host. The multi-stage Dockerfile uses `UV_TORCH_BACKEND=cpu` to avoid CUDA libraries, keeping the image at ~2.3 GB. The LanceDB index persists across container restarts via a named volume, and the embedding model is baked into the image at build time.
 
 ```bash
 # Build the image (includes all tree-sitter grammars + pre-downloaded model)
@@ -120,6 +120,8 @@ Configure Claude Code to use the Docker image in your project's `.mcp.json`:
 | Source repo | `/workspace` (read-only bind) | Codebase to index |
 | LanceDB data | `/data/lancedb` (named volume) | Persistent search index |
 
+> **Note:** Docker on macOS cannot access Apple Silicon GPUs (MPS/Metal). For GPU-accelerated embeddings on Apple Silicon, run the server natively with `uv run server.py`. For this project's default model (`all-MiniLM-L6-v2`, 22M params), CPU is actually faster than MPS due to the model's small size.
+
 ### Run the Integration Test
 
 ```bash
@@ -145,18 +147,21 @@ All settings are via environment variables:
 
 ```
 ├── lancedb-mcp-server/
-│   ├── server.py              # FastMCP entry point, 4 tools
-│   ├── chunker.py             # Tree-sitter + line-based chunking
-│   ├── indexer.py             # File discovery, hashing, ingestion
+│   ├── server.py              # FastMCP entry point, 4 tools, lifespan management
+│   ├── chunker.py             # Tree-sitter syntax-aware chunking + line-based fallback
+│   ├── indexer.py             # File discovery, content-hash change detection, LanceDB ingestion
 │   ├── config.py              # Environment-based configuration
 │   ├── test_integration.py    # End-to-end integration test
 │   ├── pyproject.toml         # Dependencies and build config
-│   ├── Dockerfile             # Multi-stage Docker build
-│   ├── docker-compose.yml     # Build orchestration + volumes
+│   ├── uv.lock                # Locked dependency versions
+│   ├── Dockerfile             # Multi-stage Docker build (CPU-only torch, ~2.3 GB image)
+│   ├── docker-compose.yml     # Build orchestration + volume definitions
+│   ├── .dockerignore          # Excludes .venv, __pycache__, .lancedb from build context
 │   └── scripts/
 │       └── prefetch_model.py  # Pre-download embedding model at build time
 ├── Docs/
 │   └── Integrating-LanceDB-with-Claude-Code-CLI.md  # Architecture guide (36 citations)
+├── CLAUDE.md                  # Claude Code project guidance (gitignored)
 └── LICENSE                    # Apache 2.0
 ```
 
