@@ -24,9 +24,10 @@ The transport layer for this integration typically utilizes Standard Input/Outpu
 | :---- | :---- | :---- |
 | **Claude Code CLI** | User interface, agentic reasoning, and tool orchestration. | TypeScript-based agentic harness.1 |
 | **MCP Client** | Managing connections to MCP servers and translating tool calls. | Built-in protocol handler in Claude Code.11 |
-| **LanceDB MCP Server** | Exposing database operations (index, search, upsert) as tools. | Python or TypeScript wrapper for LanceDB SDK.21 |
+| **LanceDB MCP Server** | Exposing database operations (index, search, project management) as tools. | Python FastMCP wrapper for LanceDB SDK with 7 tools.21 |
+| **Project Registry** | Tracking multiple project scopes with per-project table isolation. | JSON sidecar file (`_projects.json`) inside the LanceDB directory. |
 | **LanceDB Engine** | Vector storage, indexing, and high-performance retrieval. | Embedded library using the Lance columnar format.6 |
-| **Embedding Model** | Converting text/code into high-dimensional vectors. | Voyage AI, OpenAI, or local models (BGE).24 |
+| **Embedding Model** | Converting text/code into high-dimensional vectors. | Voyage AI, OpenAI, or local models (e.g., all-MiniLM-L6-v2).24 |
 
 ### Core Logic of the LanceDB Engine
 
@@ -35,6 +36,55 @@ LanceDB is uniquely suited for local development due to its disk-native indexing
 The efficiency of LanceDB stems from its use of Inverted File Index with Product Quantization (IVF-PQ). This indexing strategy partitions the vector space and compresses the high-dimensional embeddings. The compression is achieved by dividing each vector into *M* subvectors and quantizing them into centroids, which significantly reduces the memory and storage footprint.23 For instance, a 128-dimensional vector using 32-bit floats (*D* x 32 bits) can be quantized into a series of small codes, achieving up to a 16x reduction in space while maintaining high search accuracy.23
 
 This design allows LanceDB to scale to millions of vectors on a standard developer laptop using local SSD storage, which is critical for supporting massive codebases without introducing significant latency to the agent's reasoning loop.6
+
+## Multi-Project Context Switching
+
+A significant limitation of early MCP server designs is the assumption that a single server instance maps to a single codebase. Developers routinely work across multiple repositories—a frontend SPA, a backend API, a shared library—and expect their tools to follow them. The LanceDB MCP server addresses this with **table-per-project isolation**, allowing a single server process and database directory to manage independent indexes for multiple codebases.
+
+### Architecture: Table-per-Project Isolation
+
+Each registered project receives its own LanceDB table, ensuring that search results for one project never leak into another. The embedding model and database connection are shared across all projects, avoiding redundant memory usage.
+
+| Project Name | Table Name | Scope |
+| :---- | :---- | :---- |
+| `default` | `code_chunks` (legacy) | The original repository root |
+| `frontend` | `project_frontend` | A frontend SPA at `/workspace/frontend` |
+| `api-server` | `project_api-server` | A backend service at `/workspace/api` |
+
+The naming convention is straightforward: the `"default"` project uses the legacy table name `code_chunks` for full backward compatibility, while all other projects use the prefix `project_{name}`. Project names must match `^[a-zA-Z][a-zA-Z0-9_-]{0,62}$`—alphanumeric with hyphens and underscores, starting with a letter.
+
+### The Project Registry
+
+Project metadata is persisted in a `_projects.json` sidecar file inside the LanceDB directory. This file is safe from LanceDB interference because the engine only scans for `*.lance/` directories. The registry records each project's name, absolute repository root path, table name, and creation timestamp.
+
+On server startup, the lifespan handler loads the registry and applies **legacy auto-adoption**: if no `_projects.json` exists but a `code_chunks` table is present, the server automatically registers it as the `"default"` project and persists the registry. This ensures zero-friction upgrades from single-project installations.
+
+The registry is written atomically using `tempfile.mkstemp` and `os.replace` to prevent corruption from interrupted writes—an important safeguard in environments where the server may be stopped abruptly.
+
+### MCP Tools for Project Management
+
+The server exposes three dedicated project management tools alongside the four core search/indexing tools:
+
+| Tool | Purpose |
+| :---- | :---- |
+| `switch_project` | Create a new project or switch to an existing one. Requires `repo_root` for new projects. |
+| `list_projects` | List all registered projects with their repo roots and table names. Marks the active project. |
+| `remove_project` | Remove a project from the registry, optionally dropping its LanceDB table. |
+
+All four existing tools (`search_code`, `index_files`, `index_status`, `remove_files`) accept an optional `project` parameter. When omitted, they operate on the active project. When specified, they target the named project without changing the active selection—enabling cross-project queries in a single session.
+
+### Multi-Project Workflow
+
+A typical multi-repo workflow proceeds as follows:
+
+1. **Start the server**: On first run with an existing index, the legacy table is auto-adopted as `"default"`.
+2. **Register additional projects**: `switch_project(project="frontend", repo_root="/workspace/frontend")` creates a new project and switches to it.
+3. **Index per project**: `index_files()` scans only the active project's `repo_root`.
+4. **Search with isolation**: `search_code(query="authentication")` returns results only from the active project's table.
+5. **Cross-project queries**: `search_code(query="shared types", project="api-server")` targets a specific project without switching context.
+6. **Clean up**: `remove_project(project="frontend", drop_table=True)` removes the project and its indexed data.
+
+This design eliminates the need for multiple MCP server processes and keeps all vector data in a single LanceDB directory, simplifying backup and portability.
 
 ## Implementation Strategy: From Ingestion to Retrieval
 
@@ -198,7 +248,7 @@ A developer could, for example, ask Claude to "verify the current implementation
 
 For complex, multi-step tasks, Claude Code can spawn "subagents" that operate in their own isolated context windows.2 These agents can work in parallel on different parts of a task—such as one subagent refactoring a backend API while another updates the frontend types.3
 
-LanceDB acts as the "shared blackboard" for these subagent swarms. The lead agent can store its plan and intermediate results in a central LanceDB table, which subagents can query to stay aligned. This architecture prevents context bloat in any single agent and allows the system to tackle project-wide changes that would exceed the capacity of a single reasoning window.2
+LanceDB acts as the "shared blackboard" for these subagent swarms. The lead agent can store its plan and intermediate results in a central LanceDB table, which subagents can query to stay aligned. This architecture prevents context bloat in any single agent and allows the system to tackle project-wide changes that would exceed the capacity of a single reasoning window.2 With multi-project support, subagents can be assigned to different project scopes—one indexing the backend API while another searches the frontend for dependent code—all through the same MCP server instance using the `project` parameter on each tool call.
 
 ## Synthesis of Best Practices for LanceDB Integration
 
@@ -206,10 +256,11 @@ The integration of LanceDB into the Claude Code development process transforms t
 
 Key implementation priorities include:
 
-* **Prioritize Local Security**: Use stdio transport and local storage for maximum sovereignty and performance.  
-* **Implement Syntax-Aware Ingestion**: Move beyond character-count chunking to preserve the semantic integrity of source code.  
-* **Automate Maintenance**: Utilize Claude Code hooks to trigger table.optimize() and incremental updates, ensuring the index never diverges from the source.  
-* **Optimize for Token Economy**: Use progressive disclosure and concise tool outputs to maximize the utility of the context window.  
+* **Prioritize Local Security**: Use stdio transport and local storage for maximum sovereignty and performance.
+* **Implement Syntax-Aware Ingestion**: Move beyond character-count chunking to preserve the semantic integrity of source code.
+* **Isolate Projects with Table-per-Project**: Register each repository as a named project with its own LanceDB table, preventing cross-contamination of search results and enabling multi-repo workflows from a single server instance.
+* **Automate Maintenance**: Utilize Claude Code hooks to trigger table.optimize() and incremental updates, ensuring the index never diverges from the source.
+* **Optimize for Token Economy**: Use progressive disclosure and concise tool outputs to maximize the utility of the context window.
 * **Embrace Multimodality**: Leverage LanceDB's ability to store disparate data types to provide the agent with a comprehensive view of the software lifecycle, from design docs to production logs.
 
 This strategic integration ensures that Claude Code remains a force-multiplier for productivity, enabling developers to navigate the increasing complexity of modern software systems with confidence and precision. The synergy of agentic reasoning and high-performance retrieval creates a development environment where context is no longer a constraint, but a competitive advantage.
