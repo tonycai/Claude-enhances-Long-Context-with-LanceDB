@@ -92,11 +92,15 @@ class AppContext:
 def _open_or_create_table(
     db: ldb.DBConnection, table_name: str, schema: type,
 ) -> ldb.table.Table:
-    """Open an existing LanceDB table or create a new one."""
-    if table_name in db.list_tables():
+    """Open an existing LanceDB table or create a new one.
+
+    Uses open-first strategy because ``db.list_tables()`` can miss tables
+    that exist on disk (observed with persistent Docker volumes across runs).
+    """
+    try:
         table = db.open_table(table_name)
         logger.info("Opened existing table '%s'", table_name)
-    else:
+    except Exception:
         table = db.create_table(table_name, schema=schema)
         logger.info("Created new table '%s'", table_name)
     return table
