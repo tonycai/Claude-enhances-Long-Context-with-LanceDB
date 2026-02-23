@@ -20,6 +20,7 @@ from config import (
     SUPPORTED_EXTENSIONS,
     Config,
 )
+from errors import IndexingError
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,8 @@ def file_content_hash(path: Path) -> str:
     h = hashlib.sha256()
     try:
         h.update(path.read_bytes())
-    except (OSError, IOError):
+    except (OSError, IOError) as exc:
+        logger.warning("Cannot hash %s: %s", path, exc)
         return ""
     return h.hexdigest()
 
@@ -198,9 +200,8 @@ def index_files(
                 # Keep last hash per file path.
                 for fp, ch in zip(fp_col, ch_col):
                     existing_hashes[fp] = ch
-        except Exception:
-            # Table may be empty or not yet created.
-            pass
+        except Exception as exc:
+            logger.debug("Could not load existing hashes (table may be empty): %s", exc)
 
     all_records: list[dict] = []
     files_to_delete: list[str] = []
@@ -238,8 +239,11 @@ def index_files(
         try:
             table.add(all_records)
         except Exception as exc:
-            logger.error("Failed to add records to LanceDB: %s", exc)
-            raise
+            logger.error("Failed to add %d records to LanceDB: %s", len(all_records), exc)
+            raise IndexingError(
+                f"Failed to add {len(all_records)} records to LanceDB: {exc}",
+                context={"record_count": len(all_records)},
+            ) from exc
 
     result.duration_ms = int((time.monotonic() - start) * 1000)
     return result

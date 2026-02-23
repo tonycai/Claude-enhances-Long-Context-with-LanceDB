@@ -1,8 +1,16 @@
 """Integration test: index this repo and run searches against it."""
 
+import logging
 import os
 import sys
 import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("test_integration")
 
 # Point at the parent repo.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -99,7 +107,7 @@ def main():
         table.create_fts_index("text", replace=True)
         print("FTS index created successfully.")
     except Exception as e:
-        print(f"FTS index creation failed: {e}")
+        logger.warning("FTS index creation failed: %s", e)
     print()
 
     # Step 5: Run searches
@@ -137,7 +145,7 @@ def main():
                 print(f"  {i}. {fp}:{sl}-{el} [{ntype}] {sym}{score_str}")
                 print(f"     {snippet}...")
         except Exception as e:
-            print(f"  Search error: {e}")
+            logger.warning("Search error for query=%r type=%s: %s", query, qtype, e)
 
     # Step 6: Test incremental re-index (should skip unchanged)
     print()
