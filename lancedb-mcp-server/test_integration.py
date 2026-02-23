@@ -179,6 +179,7 @@ def main():
         DEFAULT_PROJECT_NAME,
         DEFAULT_TABLE_NAME,
         ProjectState,
+        check_repo_root,
         create_project,
         load_registry,
         save_registry,
@@ -212,6 +213,18 @@ def main():
     assert table_name_for_project("frontend") == "project_frontend", "frontend → project_frontend"
     print(f"    'default'  → '{table_name_for_project('default')}' (OK)")
     print(f"    'frontend' → '{table_name_for_project('frontend')}' (OK)")
+
+    # 8c-pre: Non-existent path is accepted (Docker scenario) with warning
+    print("  8c-pre: Non-existent repo_root (Docker scenario)")
+    docker_proj = create_project("docker-test", "/nonexistent/path")
+    assert docker_proj.name == "docker-test"
+    warning = check_repo_root(docker_proj.repo_root)
+    assert warning is not None, "Expected warning for non-existent path"
+    print(f"    create_project accepted non-existent path (OK)")
+    print(f"    check_repo_root warning: {warning[:60]}... (OK)")
+    # Valid path should have no warning
+    assert check_repo_root(REPO_ROOT) is None, "Expected no warning for valid path"
+    print(f"    check_repo_root for valid path: no warning (OK)")
 
     # 8c: Create a second project scoped to lancedb-mcp-server/ subdirectory
     print("  8c: Create second project")
