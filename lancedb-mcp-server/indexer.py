@@ -170,6 +170,7 @@ def index_files(
     config: Config,
     paths: list[str] | None = None,
     force: bool = False,
+    repo_root: Path | None = None,
 ) -> IndexResult:
     """Index files into LanceDB.
 
@@ -183,9 +184,11 @@ def index_files(
         Specific file paths to index. ``None`` means the full repo.
     force:
         If True, re-index files even if their content hash is unchanged.
+    repo_root:
+        Override the repo root from *config*. Used for multi-project support.
     """
     start = time.monotonic()
-    repo_root = config.repo_root_path
+    repo_root = repo_root if repo_root is not None else config.repo_root_path
     files = discover_files(repo_root, paths)
     result = IndexResult(files_scanned=len(files))
 
@@ -249,10 +252,21 @@ def index_files(
     return result
 
 
-def remove_files(table: lancedb.table.Table, paths: list[str], config: Config) -> int:
-    """Remove all chunks for the given file paths. Returns count of files removed."""
+def remove_files(
+    table: lancedb.table.Table,
+    paths: list[str],
+    config: Config,
+    repo_root: Path | None = None,
+) -> int:
+    """Remove all chunks for the given file paths. Returns count of files removed.
+
+    Parameters
+    ----------
+    repo_root:
+        Override the repo root from *config*. Used for multi-project support.
+    """
     removed = 0
-    repo_root = config.repo_root_path
+    repo_root = repo_root if repo_root is not None else config.repo_root_path
     for p in paths:
         abs_p = Path(p)
         if not abs_p.is_absolute():
