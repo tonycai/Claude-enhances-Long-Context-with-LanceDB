@@ -39,6 +39,7 @@ from projects import (
     create_project,
     load_registry,
     save_registry,
+    validate_project_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -189,7 +190,27 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             save_registry(config.db_full_path, projects)
 
     # Determine active project.
-    if DEFAULT_PROJECT_NAME in projects:
+    if config.active_project:
+        try:
+            validate_project_name(config.active_project)
+            active = config.active_project
+            if active not in projects:
+                logger.warning(
+                    "LANCEDB_ACTIVE_PROJECT='%s' is not in the registry yet; "
+                    "it will become active once created via switch_project",
+                    active,
+                )
+        except ProjectError:
+            logger.warning(
+                "LANCEDB_ACTIVE_PROJECT='%s' is not a valid project name; "
+                "falling back to default selection",
+                config.active_project,
+            )
+            active = (
+                DEFAULT_PROJECT_NAME if DEFAULT_PROJECT_NAME in projects
+                else (next(iter(projects)) if projects else None)
+            )
+    elif DEFAULT_PROJECT_NAME in projects:
         active = DEFAULT_PROJECT_NAME
     else:
         active = next(iter(projects)) if projects else None

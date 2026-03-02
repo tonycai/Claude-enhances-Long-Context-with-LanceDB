@@ -89,6 +89,9 @@ class Config:
     table_name: str = field(
         default_factory=lambda: os.environ.get("LANCEDB_TABLE_NAME", "code_chunks")
     )
+    active_project: str | None = field(
+        default_factory=lambda: os.environ.get("LANCEDB_ACTIVE_PROJECT")
+    )
 
     @property
     def repo_root_path(self) -> Path:

@@ -157,6 +157,7 @@ Each project gets its own LanceDB table, isolated from other projects. A `_proje
 | `LANCEDB_EMBEDDING_PROVIDER` | `sentence-transformers` | LanceDB registry key |
 | `LANCEDB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Embedding model name |
 | `LANCEDB_TABLE_NAME` | `code_chunks` | Default LanceDB table name |
+| `LANCEDB_ACTIVE_PROJECT` | *(unset)* | Project to activate on startup (skips default selection) |
 
 ### Supported Languages
 
@@ -183,6 +184,22 @@ Markdown, YAML, TOML, JSON, HTML, CSS, SCSS, Shell scripts, SQL, GraphQL, Protob
 5. Call `search_code(query, project="backend")` to search a specific project
 6. Call `list_projects` to see all registered projects (active marked with `*`)
 7. Call `switch_project("backend")` to switch back without re-creating
+
+**Tip:** Set `LANCEDB_ACTIVE_PROJECT` in your `.mcp.json` to auto-activate a project on startup, avoiding the need to call `switch_project` after every server restart:
+
+```json
+{
+  "mcpServers": {
+    "lancedb-code": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/lancedb-mcp-server", "server.py"],
+      "env": {
+        "LANCEDB_ACTIVE_PROJECT": "backend"
+      }
+    }
+  }
+}
+```
 
 ## Architecture
 

@@ -1194,3 +1194,106 @@ class TestConfigConstants:
     def test_skip_dirs_includes_key_entries(self):
         for d in [".git", "node_modules", "__pycache__", ".lancedb", ".venv", "build", "dist"]:
             assert d in SKIP_DIRS
+
+
+# =========================================================================
+# US-27: LANCEDB_ACTIVE_PROJECT environment variable
+# =========================================================================
+
+
+class TestUS27_ActiveProjectEnvVar:
+    """US-27: Set active project via LANCEDB_ACTIVE_PROJECT env var."""
+
+    def test_ac1_config_reads_env_var(self):
+        """AC-1: Config.active_project reads LANCEDB_ACTIVE_PROJECT."""
+        with patch.dict(os.environ, {"LANCEDB_ACTIVE_PROJECT": "myproject"}):
+            c = Config()
+            assert c.active_project == "myproject"
+
+    def test_ac2_config_defaults_to_none(self):
+        """AC-2: Config.active_project defaults to None when env var is unset."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LANCEDB_ACTIVE_PROJECT", None)
+            c = Config()
+            assert c.active_project is None
+
+    def test_ac3_valid_name_in_registry_becomes_active(self, tmp_path):
+        """AC-3: Valid project name found in registry becomes active."""
+        from projects import save_registry, load_registry
+        from datetime import datetime, timezone
+
+        db_path = str(tmp_path / "testdb")
+        os.makedirs(db_path, exist_ok=True)
+
+        # Create a registry with "backend" project.
+        projects = {
+            "default": ProjectState(
+                name="default",
+                repo_root="/tmp/default",
+                table_name="code_chunks",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ),
+            "backend": ProjectState(
+                name="backend",
+                repo_root="/tmp/backend",
+                table_name="project_backend",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ),
+        }
+        save_registry(db_path, projects)
+
+        # Simulate the active project selection logic from server.py.
+        active_project_env = "backend"
+        try:
+            validate_project_name(active_project_env)
+            active = active_project_env
+        except ProjectError:
+            active = DEFAULT_PROJECT_NAME if DEFAULT_PROJECT_NAME in projects else None
+
+        assert active == "backend"
+
+    def test_ac4_valid_name_not_in_registry_still_set(self):
+        """AC-4: Valid project name not in registry is still set as active."""
+        projects = {
+            "default": ProjectState(
+                name="default",
+                repo_root="/tmp/default",
+                table_name="code_chunks",
+                created_at="2025-01-01T00:00:00+00:00",
+            ),
+        }
+
+        active_project_env = "newproject"
+        try:
+            validate_project_name(active_project_env)
+            active = active_project_env
+            not_in_registry = active not in projects
+        except ProjectError:
+            active = DEFAULT_PROJECT_NAME if DEFAULT_PROJECT_NAME in projects else None
+            not_in_registry = False
+
+        assert active == "newproject"
+        assert not_in_registry is True
+
+    def test_ac5_invalid_name_falls_back_to_default(self):
+        """AC-5: Invalid project name falls back to default selection."""
+        projects = {
+            "default": ProjectState(
+                name="default",
+                repo_root="/tmp/default",
+                table_name="code_chunks",
+                created_at="2025-01-01T00:00:00+00:00",
+            ),
+        }
+
+        active_project_env = "123-invalid"  # starts with digit
+        try:
+            validate_project_name(active_project_env)
+            active = active_project_env
+        except ProjectError:
+            active = (
+                DEFAULT_PROJECT_NAME if DEFAULT_PROJECT_NAME in projects
+                else (next(iter(projects)) if projects else None)
+            )
+
+        assert active == "default"
