@@ -14,8 +14,10 @@ This project provides both a reference architecture document and a working imple
   - `chunker.py` — Tree-sitter syntax-aware chunking + line-based fallback
   - `indexer.py` — File discovery, content-hash change detection, LanceDB ingestion
   - `config.py` — Environment-based configuration
+  - `embeddings.py` — Embedding setup; adds `query: ` / `passage: ` prefixes for E5 models
   - `errors.py` — Custom exception hierarchy (IndexingError, SearchError, ChunkingError, ProjectError)
   - `test_integration.py` — End-to-end integration test (discovery, chunking, indexing, search, multi-project)
+  - `test_multilingual.py` — Offline tests: Swift chunking, prefixes, model-change handling, CJK full-text search
   - `pyproject.toml` — Dependencies and build config
   - `uv.lock` — Locked dependency versions
   - `Dockerfile` — Multi-stage build: builder (uv + deps + model prefetch) → runtime (slim + git)
@@ -45,6 +47,9 @@ cd lancedb-mcp-server && uv run server.py
 
 # Run the integration test
 cd lancedb-mcp-server && uv run python test_integration.py
+
+# Run the offline multilingual / Swift tests (no model download)
+cd lancedb-mcp-server && uv run pytest test_multilingual.py -v
 
 # Install with optional language grammars (Java, C/C++, Ruby, C#)
 cd lancedb-mcp-server && uv sync --extra all-languages
@@ -84,7 +89,11 @@ All agents connect to the lancedb-code MCP server via stdio transport. Prompts a
 
 ```bash
 # Build the Docker image (includes all grammars + pre-downloaded model)
+# Default model: intfloat/multilingual-e5-base (Chinese / Japanese / English)
 cd lancedb-mcp-server && docker compose build
+
+# Other models: multilingual-e5-small (faster) or bge-m3 (best, largest)
+cd lancedb-mcp-server && EMBEDDING_MODEL=BAAI/bge-m3 docker compose build
 
 # Test stdio transport responds to MCP initialize
 echo '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}},"id":1}' \
@@ -120,7 +129,8 @@ To use the Docker image with Claude Code, add this to your project's `.mcp.json`
 - The source repo is bind-mounted read-only at `/workspace`
 - The LanceDB index persists in the `lancedb-data` named volume at `/data/lancedb`
 - The embedding model is baked into the image (no download on first run)
-- `UV_TORCH_BACKEND=cpu` keeps the image at ~2.3 GB (vs ~3+ GB with CUDA)
+- `UV_TORCH_BACKEND=cpu` avoids CUDA libraries; image size depends on the model (larger with bge-m3)
+- The image sets `LANCEDB_FTS_TOKENIZER=ngram` (CJK keyword search) and `HF_HUB_OFFLINE=1` (no network at runtime)
 - Docker on macOS cannot access Apple Silicon GPUs — use native `uv run server.py` for MPS
 
 ## MCP Server: lancedb-code
@@ -155,17 +165,20 @@ Each project gets its own LanceDB table, isolated from other projects. A `_proje
 | `LANCEDB_PATH` | `./.lancedb` | Database directory |
 | `LANCEDB_REPO_ROOT` | `.` (cwd) | Repository root for the default project |
 | `LANCEDB_EMBEDDING_PROVIDER` | `sentence-transformers` | LanceDB registry key |
-| `LANCEDB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Embedding model name |
+| `LANCEDB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` (Docker: `intfloat/multilingual-e5-base`) | Embedding model name |
+| `LANCEDB_QUERY_PREFIX` / `LANCEDB_PASSAGE_PREFIX` | auto (`query: ` / `passage: ` for E5) | Prefixes added before queries / indexed text |
+| `LANCEDB_FTS_TOKENIZER` | `simple` (Docker: `ngram`) | Full-text tokenizer; `ngram` supports CJK |
+| `LANCEDB_CHUNK_TOKEN_BUDGET` | auto (480 for E5, else no limit) | Max estimated tokens per line-based chunk |
 | `LANCEDB_TABLE_NAME` | `code_chunks` | Default LanceDB table name |
 | `LANCEDB_ACTIVE_PROJECT` | *(unset)* | Project to activate on startup (skips default selection) |
 
 ### Supported Languages
 
 **Tree-sitter syntax-aware chunking** (extracts functions, classes, methods, etc.):
-Python, JavaScript, TypeScript, TSX, Rust, Go, Java*, C*, C++*, Ruby*, C#*
+Python, JavaScript, TypeScript, TSX, Rust, Go, Swift, Java*, C*, C++*, Ruby*, C#*
 
 **Line-based fallback chunking**:
-Markdown, YAML, TOML, JSON, HTML, CSS, SCSS, Shell scripts, SQL, GraphQL, Protobuf, Terraform, Dockerfiles
+Markdown, YAML, TOML, JSON, HTML, CSS, SCSS, Shell scripts, SQL, GraphQL, Protobuf, Terraform, Dockerfiles, Apple `.strings` / `.xcstrings`
 
 *\* Requires `uv sync --extra all-languages`*
 
@@ -212,7 +225,8 @@ Key design decisions:
 - Class bodies are decomposed into individual method chunks for granular search
 - Module-level code not covered by extracted entities is captured separately
 - Sensitive files (.env, keys, certs) and large files (>1 MB) are always skipped
-- Embedding model `all-MiniLM-L6-v2` (22M params, 384 dims) chosen for best signal-to-noise discrimination on code search and fastest throughput — benchmarked against `all-mpnet-base-v2` and `BAAI/bge-base-en-v1.5`
+- Embedding model `all-MiniLM-L6-v2` (22M params, 384 dims) is the native default, chosen for English code search — benchmarked against `all-mpnet-base-v2` and `BAAI/bge-base-en-v1.5`
+- The Docker image defaults to `intfloat/multilingual-e5-base` for Chinese / Japanese / English; a table built with a different model or prefixes is recreated empty on open (re-run `index_files`)
 
 Search results are compact (file path, line range, node type, symbol name, truncated snippet) so Claude can decide what to `Read` in full without wasting context tokens.
 

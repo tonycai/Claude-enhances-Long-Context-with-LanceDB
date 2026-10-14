@@ -9,6 +9,7 @@ from pathlib import Path
 from tree_sitter import Language, Node, Parser
 
 from config import (
+    CHUNK_TOKEN_BUDGET,
     FALLBACK_CHUNK_LINES,
     FALLBACK_EXTENSIONS,
     FALLBACK_OVERLAP_LINES,
@@ -56,6 +57,7 @@ def _load_language(lang_key: str) -> Language | None:
         "cpp": ("tree_sitter_cpp", "language"),
         "ruby": ("tree_sitter_ruby", "language"),
         "csharp": ("tree_sitter_c_sharp", "language"),
+        "swift": ("tree_sitter_swift", "language"),
     }
 
     spec = import_map.get(lang_key)
@@ -226,6 +228,9 @@ def _split_oversized(text: str, file_path: str, start_line: int, language: str,
 def _chunk_with_treesitter(source: bytes, file_path: str, lang_key: str,
                            lang: Language) -> list[Chunk]:
     """Parse source with Tree-sitter and extract structural chunks."""
+    if lang_key == "swift":
+        return _chunk_swift(source, file_path, lang)
+
     parser = Parser(lang)
     tree = parser.parse(source)
     root = tree.root_node
@@ -337,6 +342,168 @@ def _extract_class_methods(class_node: Node, file_path: str, lang_key: str,
                 ))
 
 
+# ---------------------------------------------------------------------------
+# Swift
+# ---------------------------------------------------------------------------
+
+# class_declaration covers class, struct, enum, actor and extension; the
+# declaration_kind field says which one.
+_SWIFT_KIND_TO_TYPE: dict[str, str] = {
+    "class": "class",
+    "struct": "struct",
+    "enum": "enum",
+    "actor": "class",
+    "extension": "impl",
+}
+_SWIFT_COMMENT_TYPES = {"comment", "multiline_comment"}
+_SWIFT_MEMBER_TYPES = {
+    "function_declaration",
+    "init_declaration",
+    "deinit_declaration",
+    "subscript_declaration",
+    "protocol_function_declaration",
+}
+
+
+def _swift_type_kind(node: Node) -> str | None:
+    """Chunk node_type for a Swift type declaration, or None."""
+    if node.type == "protocol_declaration":
+        return "interface"
+    if node.type != "class_declaration":
+        return None
+    kind = node.child_by_field_name("declaration_kind")
+    kind_text = kind.text.decode("utf-8", errors="replace") if kind else "class"
+    return _SWIFT_KIND_TO_TYPE.get(kind_text, "class")
+
+
+def _swift_symbol(node: Node) -> str:
+    if node.type == "init_declaration":
+        return "init"
+    if node.type == "deinit_declaration":
+        return "deinit"
+    if node.type == "subscript_declaration":
+        return "subscript"
+    return _extract_symbol_name(node)
+
+
+def _swift_member_wanted(node: Node) -> bool:
+    """Methods, initializers and multi-line properties (e.g. SwiftUI ``body``)."""
+    if node.type in _SWIFT_MEMBER_TYPES:
+        return True
+    if node.type == "property_declaration":
+        computed = any(c.type == "computed_property" for c in node.children)
+        return computed or (node.end_point[0] - node.start_point[0]) >= 2
+    return False
+
+
+def _leading_comment_start(siblings: list[Node], idx: int) -> Node:
+    """First node of the comment block directly above ``siblings[idx]``.
+
+    Doc comments often explain intent in the author's own language, so they
+    are kept with the declaration they describe.
+    """
+    first = siblings[idx]
+    j = idx - 1
+    while (
+        j >= 0
+        and siblings[j].type in _SWIFT_COMMENT_TYPES
+        and siblings[j].end_point[0] >= first.start_point[0] - 1
+    ):
+        first = siblings[j]
+        j -= 1
+    return first
+
+
+def _swift_chunks_for(text: str, file_path: str, start_line: int, end_line: int,
+                      node_type: str, symbol: str) -> list[Chunk]:
+    if len(text) > MAX_CHUNK_CHARS:
+        return _split_oversized(text, file_path, start_line, "swift", node_type, symbol)
+    return [Chunk(
+        text=text,
+        file_path=file_path,
+        start_line=start_line,
+        end_line=end_line,
+        language="swift",
+        node_type=node_type,
+        symbol_name=symbol,
+    )]
+
+
+def _swift_body(node: Node) -> Node | None:
+    body = node.child_by_field_name("body")
+    if body is not None:
+        return body
+    for child in node.children:
+        if child.type.endswith("_body"):
+            return child
+    return None
+
+
+def _extract_swift_members(type_node: Node, source: bytes, file_path: str,
+                           type_name: str, chunks: list[Chunk]) -> None:
+    """Add chunks for the members of a Swift type, recursing into nested types."""
+    body = _swift_body(type_node)
+    if body is None:
+        return
+    members = list(body.children)
+    for i, member in enumerate(members):
+        nested_kind = _swift_type_kind(member)
+        if nested_kind is None and not _swift_member_wanted(member):
+            continue
+        first = _leading_comment_start(members, i)
+        text = source[first.start_byte:member.end_byte].decode("utf-8", errors="replace")
+        symbol = _swift_symbol(member)
+        qualified = f"{type_name}.{symbol}" if symbol else type_name
+        if nested_kind is not None:
+            _extract_swift_members(member, source, file_path, qualified, chunks)
+        chunks.extend(_swift_chunks_for(
+            text, file_path, first.start_point[0] + 1, member.end_point[0] + 1,
+            nested_kind or "method", qualified,
+        ))
+
+
+def _chunk_swift(source: bytes, file_path: str, lang: Language) -> list[Chunk]:
+    """Chunk a Swift file: types, their members, and top-level functions."""
+    tree = Parser(lang).parse(source)
+    siblings = list(tree.root_node.children)
+
+    chunks: list[Chunk] = []
+    covered: list[tuple[int, int]] = []
+
+    for i, node in enumerate(siblings):
+        kind = _swift_type_kind(node)
+        if kind is None and node.type == "function_declaration":
+            kind = "function"
+        if kind is None:
+            continue
+
+        first = _leading_comment_start(siblings, i)
+        text = source[first.start_byte:node.end_byte].decode("utf-8", errors="replace")
+        symbol = _swift_symbol(node)
+        if kind != "function":
+            _extract_swift_members(node, source, file_path, symbol, chunks)
+        chunks.extend(_swift_chunks_for(
+            text, file_path, first.start_point[0] + 1, node.end_point[0] + 1,
+            kind, symbol,
+        ))
+        covered.append((first.start_byte, node.end_byte))
+
+    module_text = _extract_uncovered_text(source, covered)
+    if module_text.strip():
+        chunks.append(Chunk(
+            text=module_text if len(module_text) <= MAX_CHUNK_CHARS
+            else module_text[:MAX_CHUNK_CHARS],
+            file_path=file_path,
+            start_line=1,
+            end_line=1 + module_text.count("\n"),
+            language="swift",
+            node_type="module",
+            symbol_name="",
+        ))
+
+    return chunks
+
+
 def _extract_uncovered_text(source: bytes, covered: list[tuple[int, int]]) -> str:
     """Extract source text not covered by any extracted entity."""
     if not covered:
@@ -367,13 +534,39 @@ def _extract_uncovered_text(source: bytes, covered: list[tuple[int, int]]) -> st
     return b"\n".join(parts).decode("utf-8", errors="replace")
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 ASCII chars per token, 1 token per CJK char."""
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    return (len(text) - ascii_chars) + (ascii_chars + 3) // 4
+
+
+def _window_end(lines: list[str], start: int) -> int:
+    """End (exclusive) of the next line window, honouring the token budget."""
+    hard_end = min(start + FALLBACK_CHUNK_LINES, len(lines))
+    if CHUNK_TOKEN_BUDGET <= 0:
+        return hard_end
+    end = start + 1  # always take at least one line
+    used = estimate_tokens(lines[start])
+    while end < hard_end:
+        cost = estimate_tokens(lines[end]) + 1
+        if used + cost > CHUNK_TOKEN_BUDGET:
+            break
+        used += cost
+        end += 1
+    return end
+
+
 def _chunk_by_lines(text: str, file_path: str, language: str) -> list[Chunk]:
-    """Fall back to line-based chunking with overlap."""
+    """Fall back to line-based chunking with overlap.
+
+    Windows hold up to FALLBACK_CHUNK_LINES lines, and stop earlier when
+    CHUNK_TOKEN_BUDGET is set and the next line would exceed it.
+    """
     lines = text.split("\n")
     chunks: list[Chunk] = []
     i = 0
     while i < len(lines):
-        end = min(i + FALLBACK_CHUNK_LINES, len(lines))
+        end = _window_end(lines, i)
         chunk_text = "\n".join(lines[i:end])
         chunks.append(Chunk(
             text=chunk_text,
@@ -386,7 +579,7 @@ def _chunk_by_lines(text: str, file_path: str, language: str) -> list[Chunk]:
         ))
         if end >= len(lines):
             break
-        i = end - FALLBACK_OVERLAP_LINES
+        i = end - min(FALLBACK_OVERLAP_LINES, (end - i) // 2)
     return chunks
 
 

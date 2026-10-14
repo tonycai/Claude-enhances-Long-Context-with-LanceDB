@@ -1187,7 +1187,7 @@ class TestConfigConstants:
         expected_keys = {
             ".py", ".js", ".mjs", ".jsx", ".ts", ".tsx",
             ".rs", ".go", ".java", ".c", ".h",
-            ".cpp", ".hpp", ".cc", ".rb", ".cs",
+            ".cpp", ".hpp", ".cc", ".rb", ".cs", ".swift",
         }
         assert expected_keys == set(SUPPORTED_EXTENSIONS.keys())
 

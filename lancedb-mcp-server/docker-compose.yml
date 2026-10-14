@@ -12,6 +12,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Override: EMBEDDING_MODEL=BAAI/bge-m3 docker compose build
+        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
     image: lancedb-code-mcp:latest
     stdin_open: true        # -i (keep stdin open for JSON-RPC)
     tty: false              # no TTY — TTY corrupts the binary JSON-RPC stream

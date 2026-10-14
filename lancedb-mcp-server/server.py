@@ -20,13 +20,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import lancedb as ldb
-from lancedb.embeddings import get_registry
 from lancedb.pydantic import LanceModel, Vector
 from lancedb.rerankers import RRFReranker
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from config import VALID_NODE_TYPES, Config
+from embeddings import (
+    build_embedding_function,
+    embedding_signature_of_function,
+    embedding_signature_of_table,
+)
 from errors import ProjectError
 from indexer import IndexResult
 from indexer import index_files as do_index_files
@@ -88,15 +92,22 @@ class AppContext:
     projects: dict[str, ProjectState]       # name → state
     active_project: str | None
     tables: dict[str, ldb.table.Table] = field(default_factory=dict)  # lazy cache
+    # (model name, query prefix, passage prefix) new tables are built with.
+    embedding_signature: tuple[str, str, str] | None = None
 
 
 def _open_or_create_table(
     db: ldb.DBConnection, table_name: str, schema: type,
+    expected_signature: tuple[str, str, str] | None = None,
 ) -> ldb.table.Table:
     """Open an existing LanceDB table or create a new one.
 
     Uses open-first strategy because ``db.list_tables()`` can miss tables
     that exist on disk (observed with persistent Docker volumes across runs).
+
+    If the existing table was built with a different embedding model or
+    different prefixes, its vectors cannot be compared with new queries, so
+    the table is dropped and recreated empty; run index_files to rebuild it.
     """
     try:
         table = db.open_table(table_name)
@@ -104,6 +115,18 @@ def _open_or_create_table(
     except Exception:
         table = db.create_table(table_name, schema=schema)
         logger.info("Created new table '%s'", table_name)
+        return table
+
+    if expected_signature is not None:
+        actual = embedding_signature_of_table(table)
+        if actual is not None and actual != expected_signature:
+            logger.warning(
+                "Table '%s' was built with embedding %s but the server uses %s; "
+                "recreating it empty (run index_files to rebuild)",
+                table_name, actual, expected_signature,
+            )
+            db.drop_table(table_name)
+            table = db.create_table(table_name, schema=schema)
     return table
 
 
@@ -133,7 +156,7 @@ def _resolve_table(
     # Lazy-open the table.
     if name not in app.tables:
         app.tables[name] = _open_or_create_table(
-            app.db, proj.table_name, app.schema,
+            app.db, proj.table_name, app.schema, app.embedding_signature,
         )
 
     return app.tables[name], proj
@@ -151,9 +174,11 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     db = ldb.connect(config.db_full_path)
 
     # Load embedding function from registry.
-    registry = get_registry()
-    embedding_func = registry.get(config.embedding_provider).create(
-        name=config.embedding_model
+    embedding_func = build_embedding_function(config)
+    signature = embedding_signature_of_function(embedding_func)
+    logger.info(
+        "  Prefixes: query=%r passage=%r; FTS tokenizer: %s",
+        signature[1], signature[2], config.fts_tokenizer,
     )
     schema = _build_schema(embedding_func)
 
@@ -226,6 +251,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         schema=schema,
         projects=projects,
         active_project=active,
+        embedding_signature=signature,
     )
 
     try:
@@ -254,7 +280,10 @@ mcp = FastMCP(
         "For multi-repo setups: use switch_project to create/switch between "
         "project contexts, each with its own isolated index and repo root. "
         "Use list_projects to see all registered projects and index_status "
-        "to check if an index needs rebuilding."
+        "to check if an index needs rebuilding. "
+        "Queries can be written in any language the embedding model supports "
+        "(index_status shows the model); with a multilingual model, Chinese, "
+        "Japanese and English queries all find matching code and docs."
     ),
     lifespan=app_lifespan,
 )
@@ -322,7 +351,7 @@ def switch_project(
 
         # Eagerly open/create the table so it's ready.
         app.tables[project] = _open_or_create_table(
-            app.db, proj.table_name, app.schema,
+            app.db, proj.table_name, app.schema, app.embedding_signature,
         )
 
         save_registry(app.config.db_full_path, app.projects)
@@ -580,7 +609,7 @@ def index_files(
     paths for incremental updates after editing files. Unchanged files are
     automatically skipped via content-hash detection unless ``force=True``.
 
-    Supports Python, JavaScript, TypeScript, Rust, Go, and more via Tree-sitter
+    Supports Python, JavaScript, TypeScript, Rust, Go, Swift, and more via Tree-sitter
     syntax-aware chunking. Other text formats use line-based fallback chunking.
 
     Args:
@@ -612,7 +641,7 @@ def index_files(
 
     # Rebuild FTS index after ingestion.
     try:
-        table.create_fts_index("text", replace=True)
+        table.create_fts_index("text", replace=True, **app.config.fts_index_kwargs())
     except Exception as exc:
         logger.warning("FTS index rebuild failed (non-fatal): %s", exc)
 
@@ -688,6 +717,8 @@ def index_status(
     return (
         f"Index status for project '{proj.name}':\n"
         f"  Repo root: {proj.repo_root}\n"
+        f"  Embedding model: {app.config.embedding_model} "
+        f"(FTS tokenizer: {app.config.fts_tokenizer})\n"
         f"  Total chunks: {total_chunks}\n"
         f"  Total files: {total_files}\n"
         f"  Languages: {lang_summary}\n"

@@ -11,7 +11,7 @@ Claude Code's context window is finite. On large repositories, reading every fil
 This project provides an MCP (Model Context Protocol) server backed by [LanceDB](https://lancedb.com/) that:
 
 1. **Indexes** your codebase into semantic chunks using Tree-sitter syntax parsing
-2. **Embeds** those chunks using sentence-transformers (`all-MiniLM-L6-v2`, 22M params, 384 dims)
+2. **Embeds** those chunks using sentence-transformers (`all-MiniLM-L6-v2` for native runs; the Docker image defaults to the multilingual `intfloat/multilingual-e5-base` — see [Multilingual search](#multilingual-search))
 3. **Searches** via hybrid vector + full-text search with Reciprocal Rank Fusion reranking
 4. **Returns** compact results (file path, line range, node type, symbol name, truncated snippet) so Claude can decide what to read in full
 
@@ -53,16 +53,42 @@ On startup, the FastMCP server connects to LanceDB, loads the embedding function
 ## Supported Languages
 
 **Tree-sitter syntax-aware chunking** (extracts functions, classes, methods, interfaces, structs, enums, traits, impl blocks):
-- Python, JavaScript, TypeScript, TSX, Rust, Go
+- Python, JavaScript, TypeScript, TSX, Rust, Go, Swift
 - Java, C, C++, Ruby, C# *(optional, install with `--extra all-languages`)*
 
 **Line-based fallback chunking** (50 lines, 5-line overlap):
-- Markdown, YAML, TOML, JSON, HTML, CSS, SCSS, Shell, SQL, GraphQL, Protobuf, Terraform, Dockerfiles
+- Markdown, YAML, TOML, JSON, HTML, CSS, SCSS, Shell, SQL, GraphQL, Protobuf, Terraform, Dockerfiles, Apple `.strings` / `.xcstrings`
+
+**Swift**: structs, classes, actors, enums, protocols and extensions (as `impl`) are extracted with their members — methods, initializers, subscripts and multi-line properties such as a SwiftUI `body`. Doc comments directly above a declaration stay in its chunk.
 
 **Always skipped**:
 - Sensitive files: `.env`, `*.pem`, `*.key`, `*.crt`, SSH keys
 - Large files: >1 MB
 - Build directories: `node_modules`, `__pycache__`, `.venv`, `target`, `build`, `dist`, `vendor`, etc.
+
+## Multilingual search
+
+The Docker image is set up for code and docs written in Chinese, Japanese and English:
+
+- **Embedding model**: `intfloat/multilingual-e5-base` by default (278M params, 768 dims, 512-token input). E5 models expect `query: ` / `passage: ` prefixes; the server adds them automatically and records them in the table metadata.
+- **Keyword search**: the full-text index uses 2–3 character n-grams (`LANCEDB_FTS_TOKENIZER=ngram`), so CJK words match even though they are not separated by spaces.
+- **Chunk size**: with an E5 model, Markdown and other line-based chunks are kept under ~480 estimated tokens (one token per CJK character), so text is not cut off before embedding.
+- **Offline at runtime**: the model is downloaded at build time; the container runs with `HF_HUB_OFFLINE=1`.
+
+Pick another model at build time:
+
+| Model | Size | Dims | Max input | Notes |
+|-------|------|------|-----------|-------|
+| `intfloat/multilingual-e5-small` | 118M | 384 | 512 tokens | Fastest, smallest image |
+| `intfloat/multilingual-e5-base` *(default)* | 278M | 768 | 512 tokens | Balanced |
+| `BAAI/bge-m3` | 568M | 1024 | 8192 tokens | Best quality and long text; give Docker ≥ 6 GB memory |
+
+```bash
+cd lancedb-mcp-server
+EMBEDDING_MODEL=BAAI/bge-m3 docker compose build
+```
+
+If the server finds a table built with a different model or prefixes, it recreates that table empty (old vectors cannot be compared with new queries). Run `index_files` again afterwards.
 
 ## Quick Start
 
@@ -113,7 +139,7 @@ Build and run without installing Python, uv, or any native dependencies on your 
 - Multi-stage build: builder (Python 3.12 + uv + all deps) → runtime (Python 3.12-slim + git + uv)
 - `UV_TORCH_BACKEND=cpu` avoids CUDA libraries, keeping the image at ~2.3 GB
 - All tree-sitter grammars included (including optional languages)
-- Embedding model pre-downloaded and baked into the image via `scripts/prefetch_model.py`
+- Embedding model (multilingual by default, `EMBEDDING_MODEL` build arg) pre-downloaded and baked into the image via `scripts/prefetch_model.py`
 - LanceDB index persists across container restarts via a named volume
 
 ```bash
@@ -151,7 +177,7 @@ Configure Claude Code to use the Docker image in your project's `.mcp.json`:
 | Source repo | `/workspace` (read-only bind) | Codebase to index |
 | LanceDB data | `/data/lancedb` (named volume) | Persistent search index |
 
-> **Note:** Docker on macOS runs in a Linux VM and cannot access Apple Silicon GPUs (MPS/Metal). For the default model (`all-MiniLM-L6-v2`, 22M params), CPU is faster than MPS due to the model's small size, so this is not a limitation in practice.
+> **Note:** Docker on macOS runs in a Linux VM and cannot access Apple Silicon GPUs (MPS/Metal), so embeddings run on CPU. Indexing a small repository with the default multilingual model takes a minute or two; searches embed only the short query.
 
 ### Run the Integration Test
 
@@ -171,7 +197,10 @@ All settings are via environment variables:
 | `LANCEDB_PATH` | `./.lancedb` | Database directory (relative to repo root if not absolute) |
 | `LANCEDB_REPO_ROOT` | `.` (cwd) | Repository root for file scanning |
 | `LANCEDB_EMBEDDING_PROVIDER` | `sentence-transformers` | LanceDB embedding registry key |
-| `LANCEDB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Embedding model name (22M params, 384 dims) |
+| `LANCEDB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` (Docker: `intfloat/multilingual-e5-base`) | Embedding model name |
+| `LANCEDB_QUERY_PREFIX` / `LANCEDB_PASSAGE_PREFIX` | auto (`query: ` / `passage: ` for E5, empty otherwise) | Text added before queries / indexed chunks |
+| `LANCEDB_FTS_TOKENIZER` | `simple` (Docker: `ngram`) | Full-text tokenizer; `ngram` supports Chinese and Japanese |
+| `LANCEDB_CHUNK_TOKEN_BUDGET` | auto (480 for E5, else no limit) | Max estimated tokens per line-based chunk |
 | `LANCEDB_TABLE_NAME` | `code_chunks` | LanceDB table name |
 
 ## Key Dependencies
@@ -180,8 +209,8 @@ All settings are via environment variables:
 |---------|---------|
 | `lancedb` >=0.21.2 | Vector database with auto-embedding and hybrid search |
 | `mcp[cli]` >=1.6.0 | Model Context Protocol server framework (FastMCP) |
-| `sentence-transformers` >=4.0.0 | Embedding model (`all-MiniLM-L6-v2`) |
-| `tree-sitter` >=0.23.0 | Syntax-aware code parsing |
+| `sentence-transformers` >=4.0.0 | Embedding models (`all-MiniLM-L6-v2`, multilingual E5, BGE-M3) |
+| `tree-sitter` >=0.23.0 | Syntax-aware code parsing (`tree-sitter-swift` for Swift) |
 | `pathspec` >=0.12.0 | `.gitignore`-compatible file matching |
 
 ## Agent Team (Claude Agent SDK)
